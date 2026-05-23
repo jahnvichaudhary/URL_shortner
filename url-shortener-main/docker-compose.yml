@@ -1,0 +1,182 @@
+# ══════════════════════════════════════════════════════════════
+#  docker-compose.yml
+#  Orchestrates three containers:
+#  1. PostgreSQL — persistent database
+#  2. Redis      — in-memory cache
+#  3. App        — Spring Boot URL shortener
+#
+#  Start everything:  docker-compose up -d
+#  Stop everything:   docker-compose down
+#  View logs:         docker-compose logs -f
+#  View app logs:     docker-compose logs -f app
+# ══════════════════════════════════════════════════════════════
+
+services:
+
+  # ── 1. PostgreSQL ─────────────────────────────────────────────
+  # The persistent relational database
+  # Stores all URL mappings permanently
+  postgres:
+    image: postgres:16-alpine
+    # postgres:16      = PostgreSQL version 16
+    # alpine           = minimal Linux — smaller image
+
+    container_name: urlshortener-postgres
+
+    environment:
+      # These environment variables configure PostgreSQL
+      # on first startup — creates database and user
+      POSTGRES_DB: urlshortener
+      POSTGRES_USER: urluser
+      POSTGRES_PASSWORD: urlpassword
+      # In production use Docker secrets or AWS Secrets Manager
+      # Never hardcode real passwords like this
+
+    ports:
+      - "5432:5432"
+      # HOST:CONTAINER port mapping
+      # Exposes PostgreSQL on your laptop at port 5432
+      # Useful for connecting with database tools like DBeaver
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # postgres_data = named volume (defined at bottom)
+      # /var/lib/postgresql/data = where PostgreSQL stores data
+      # Data survives container restarts
+
+    healthcheck:
+      # Docker checks this command repeatedly
+      # Until it succeeds before starting dependent services
+      test: ["CMD-SHELL",
+             "pg_isready -U urluser -d urlshortener"]
+      interval: 10s     # check every 10 seconds
+      timeout: 5s       # fail if no response in 5 seconds
+      retries: 5        # try 5 times before giving up
+      start_period: 30s # give PostgreSQL 30s to start first
+
+    networks:
+      - urlshortener-network
+
+  # ── 2. Redis ──────────────────────────────────────────────────
+  # The in-memory cache
+  # Stores URL mappings for fast redirect resolution
+  redis:
+    image: redis:7-alpine
+    # redis:7 = Redis version 7 (latest stable)
+
+    container_name: urlshortener-redis
+
+    ports:
+      - "6379:6379"
+      # Exposes Redis on your laptop at port 6379
+      # Useful for inspecting cache with redis-cli
+
+    volumes:
+      - redis_data:/data
+      # Persists Redis data across restarts
+      # Without this cache is empty on every restart
+
+    command: redis-server --appendonly yes
+    # --appendonly yes = enables Redis persistence
+    # Redis writes every operation to a log file
+    # Data survives container restarts
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      # redis-cli ping → Redis responds PONG when healthy
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+    networks:
+      - urlshortener-network
+
+  # ── 3. Spring Boot App ────────────────────────────────────────
+  # The URL shortener application
+  # Depends on both PostgreSQL and Redis being healthy
+  app:
+    image: url-shortener:latest
+    pull_policy: never
+    # Uses the image we built with: docker build -t url-shortener:latest .
+    # Must build the image before running docker-compose up
+
+    container_name: urlshortener-app
+
+    ports:
+      - "8080:8080"
+      # Your app is available at http://localhost:8080
+
+    environment:
+      # ── Spring profile ──────────────────────────────────────
+      # Activates the prod profile in application.yml
+      SPRING_PROFILES_ACTIVE: prod
+
+      # ── Database connection ─────────────────────────────────
+      # "postgres" = the service name above = hostname
+      # urlshortener = database name
+      # urluser = username
+      DB_URL: jdbc:postgresql://postgres:5432/urlshortener
+      DB_USERNAME: urluser
+      DB_PASSWORD: urlpassword
+
+      # ── Redis connection ────────────────────────────────────
+      # "redis" = the service name above = hostname
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+      # ── Snowflake config ────────────────────────────────────
+      # Each container must have unique combination
+      # When scaling to multiple containers:
+      # Container 1: DATACENTER_ID=1, MACHINE_ID=1
+      # Container 2: DATACENTER_ID=1, MACHINE_ID=2
+      # Container 3: DATACENTER_ID=1, MACHINE_ID=3
+      DATACENTER_ID: 1
+      MACHINE_ID: 1
+
+      # ── App config ──────────────────────────────────────────
+      BASE_URL: http://localhost:8080
+
+      # ── JVM options ─────────────────────────────────────────
+      JAVA_OPTS: >-
+        -XX:+UseContainerSupport
+        -XX:MaxRAMPercentage=75.0
+        -XX:+UseG1GC
+
+    depends_on:
+      # Wait for postgres to be healthy before starting app
+      postgres:
+        condition: service_healthy
+      # Wait for redis to be healthy before starting app
+      redis:
+        condition: service_healthy
+
+    # Restart policy
+    # If app crashes Docker automatically restarts it
+    # unless: = only restart if it crashed — not if you
+    # manually stopped it with docker-compose down
+    restart: unless-stopped
+
+    networks:
+      - urlshortener-network
+
+# ── Networks ───────────────────────────────────────────────────
+# All three services join this network
+# They can reach each other using service names as hostnames
+# Isolated from other Docker networks on your machine
+networks:
+  urlshortener-network:
+    driver: bridge
+    # bridge = standard Docker network
+    # Containers on same bridge network can talk to each other
+    # Isolated from containers on other networks
+
+# ── Volumes ────────────────────────────────────────────────────
+# Named volumes managed by Docker
+# Data persists across docker-compose down/up cycles
+# docker-compose down -v = removes volumes too (deletes all data)
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
