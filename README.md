@@ -156,9 +156,3 @@ src/main/java/com/urlshortener/
 
 ---
 
-## Future Improvements
-
-- [ ] QR code generation per short URL
-- [ ] Rate limiting per IP (Bucket4j)
-- [ ] Dashboard frontend
-- [ ] Geographic click breakdown
