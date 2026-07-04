@@ -1,12 +1,37 @@
-FROM maven:3.9-eclipse-temurin-17 AS build
-WORKDIR /src
-COPY pom.xml .
-RUN mvn -B dependency:go-offline
-COPY src ./src
-RUN mvn -B clean package -DskipTests
 
-FROM eclipse-temurin:17-jre
+
+FROM amazoncorretto:21-alpine AS builder
+
 WORKDIR /app
-COPY --from=build /src/target/taskrunner-app-1.0.0.jar /app/app.jar
+
+RUN apk add --no-cache maven
+
+COPY pom.xml .
+
+RUN mvn dependency:go-offline -B
+
+COPY src ./src
+
+RUN mvn package -DskipTests -B
+
+FROM amazoncorretto:21-alpine AS runner
+
+WORKDIR /app
+
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+COPY --from=builder /app/target/*.jar app.jar
+
+RUN chown appuser:appgroup app.jar
+
+USER appuser
+
 EXPOSE 8080
-ENTRYPOINT ["java","-jar","/app/app.jar"]
+
+ENV JAVA_OPTS="\
+  -XX:+UseContainerSupport \
+  -XX:MaxRAMPercentage=75.0 \
+  -XX:+UseG1GC \
+  -Djava.security.egd=file:/dev/./urandom"
+
+ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar app.jar"]

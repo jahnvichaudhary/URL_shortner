@@ -1,130 +1,126 @@
-# taskrunner
 
-A tiny background job processor I threw together. Submit work over HTTP,
-it gets queued, worker threads pick it up, and failed jobs get retried
-with exponential backoff. Status of any job is a single GET away.
 
-Stack: Java 17 + Spring Boot 3. No database — jobs live in memory. If you
-need them to survive restarts, swap `JobStore` for a JPA repo and you're
-set.
+## Architecture
+Internet → Controller → Service → Redis Cache → PostgreSQL
 
-## Run it
+- **ID Generation** — Twitter Snowflake algorithm generates
+  4 million unique IDs per millisecond across 1024 servers
+  without any central coordination
+- **Encoding** — Base62 encoding compresses 64-bit IDs into
+  7-character alphanumeric short codes (3.5 trillion capacity)
+- **Caching** — Redis Cache-Aside pattern reduces database
+  load by ~95% on high-traffic links
+- **Containerisation** — Full Docker Compose stack with
+  Spring Boot, PostgreSQL, and Redis
 
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Backend | Java 21, Spring Boot 4 |
+| Database | PostgreSQL 16 |
+| Cache | Redis 7 |
+| ORM | Hibernate / Spring Data JPA |
+| Container | Docker, Docker Compose |
+| API Docs | SpringDoc OpenAPI / Swagger UI |
+| Build | Maven |
+
+## API Endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | /api/v1/urls | Create short URL |
+| GET | /r/{shortCode} | Redirect to original URL |
+| GET | /api/v1/urls/{code} | Get URL metadata |
+| DELETE | /api/v1/urls/{code} | Deactivate URL |
+| GET | /api/v1/stats | Platform statistics |
+| GET | /swagger-ui.html | API documentation |
+
+## Key Design Decisions
+
+**Why Twitter Snowflake over UUID?**
+UUIDs are random — they cause B-tree index fragmentation
+in PostgreSQL at scale. Snowflake IDs are time-ordered,
+globally unique, and generated without database coordination.
+
+**Why Redis Cache-Aside?**
+The redirect endpoint is called millions of times per day.
+Caching the URL mapping in Redis means 95%+ of redirects
+never touch the database — sub-millisecond response times.
+
+**Why 302 over 301?**
+301 is cached by browsers permanently — you lose all click
+tracking and cannot deactivate links. 302 checks the server
+every time giving full control.
+
+**Why soft delete?**
+Deleting rows destroys analytics history. Setting
+isActive=false preserves click data while stopping redirects.
+
+## Running Locally
+
+### Prerequisites
+- Docker Desktop
+- Java 21
+- Maven
+
+### Start everything with one command
 ```bash
-mvn spring-boot:run
+docker compose up -d
 ```
 
-App boots on **http://localhost:8080**.
-
-Or build a jar and run it:
-
+### Test it
 ```bash
-mvn clean package
-java -jar target/taskrunner-app-1.0.0.jar
-```
-
-## Endpoints
-
-| Method | URL                                           | What it does                  |
-|--------|-----------------------------------------------|-------------------------------|
-| GET    | http://localhost:8080/                        | service info + handler list   |
-| GET    | http://localhost:8080/health                  | health + queue depth          |
-| POST   | http://localhost:8080/api/jobs                | submit a job                  |
-| GET    | http://localhost:8080/api/jobs/{id}           | check a job's status          |
-| GET    | http://localhost:8080/api/jobs?limit=25       | recent jobs                   |
-
-## Try it
-
-Submit an echo job:
-
-```bash
-curl -X POST http://localhost:8080/api/jobs \
+# Create a short URL
+curl -X POST http://localhost:8080/api/v1/urls \
   -H "Content-Type: application/json" \
-  -d '{"type":"echo","payload":{"msg":"hello world"}}'
+  -d '{"originalUrl": "https://www.github.com", "expiryDays": 30}'
+
+# Use the short code from the response
+curl http://localhost:8080/r/YOUR_SHORT_CODE
+
+# Open API docs
+open http://localhost:8080/swagger-ui.html
 ```
 
-Response:
+## Project Structure
 
-```json
-{
-  "id": "b6d3...",
-  "status": "QUEUED",
-  "statusUrl": "http://localhost:8080/api/jobs/b6d3..."
-}
+```
+src/main/java/com/urlshortener/
+│
+├── UrlShortenerApplication.java
+│
+├── util/
+│   ├── SnowflakeIdGenerator.java
+│   └── Base62Encoder.java
+│
+├── entity/
+│   └── UrlMapping.java
+│
+├── repository/
+│   └── UrlMappingRepository.java
+│
+├── dto/
+│   ├── ShortenRequest.java
+│   ├── ShortenResponse.java
+│   └── ErrorResponse.java
+│
+├── config/
+│   └── RedisConfig.java
+│
+├── service/
+│   └── UrlService.java
+│
+├── controller/
+│   └── UrlController.java
+│
+└── exception/
+    ├── UrlNotFoundException.java
+    ├── UrlExpiredException.java
+    ├── UrlInactiveException.java
+    ├── AliasAlreadyExistsException.java
+    ├── SnowflakeException.java
+    └── GlobalExceptionHandler.java
 ```
 
-Then poll:
 
-```bash
-curl http://localhost:8080/api/jobs/b6d3...
-```
-
-### See the retry logic in action
-
-```bash
-curl -X POST http://localhost:8080/api/jobs \
-  -H "Content-Type: application/json" \
-  -d '{"type":"flaky","payload":{"failRate":0.8}}'
-```
-
-Watch the `attempts` counter climb each time you poll. After 3 failed
-attempts it's marked `FAILED`; otherwise eventually `SUCCEEDED`.
-
-### Slow job (good for watching the queue back up)
-
-```bash
-for i in $(seq 1 10); do
-  curl -s -X POST http://localhost:8080/api/jobs \
-    -H "Content-Type: application/json" \
-    -d '{"type":"sleep","payload":{"ms":2000}}' >/dev/null
-done
-curl http://localhost:8080/api/jobs
-```
-
-## Config knobs
-
-In `src/main/resources/application.properties`:
-
-- `server.port=8080` — change the listen port
-- `taskrunner.workers=4` — concurrent workers
-- `taskrunner.max-retries=3` — give-up threshold
-- `taskrunner.retry-backoff-ms=500` — base backoff (doubles each retry)
-
-## Adding your own job type
-
-Implement `JobHandler`, drop `@Component` on it, done:
-
-```java
-@Component
-public class EmailHandler implements JobHandler {
-    public String type() { return "send-email"; }
-    public Object handle(Job job) {
-        // ... do the thing
-        return "sent";
-    }
-}
-```
-
-Then POST `{"type":"send-email","payload":{...}}`.
-
-## Deploy
-
-Any host that runs a JVM is fine. I usually do:
-
-```bash
-mvn clean package
-scp target/taskrunner-app-1.0.0.jar user@server:/opt/taskrunner/
-# on the server:
-java -jar /opt/taskrunner/taskrunner-app-1.0.0.jar
-```
-
-Stick it behind nginx or just open port 8080 if you don't care.
-
-For Docker, a 5-line Dockerfile does it:
-
-```dockerfile
-FROM eclipse-temurin:17-jre
-COPY target/taskrunner-app-1.0.0.jar /app.jar
-EXPOSE 8080
-ENTRYPOINT ["java","-jar","/app.jar"]
-```
